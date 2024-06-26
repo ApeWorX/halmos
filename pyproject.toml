@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools_scm[toml]>=6.2", "black"]
+requires = ["setuptools>=61.0", "setuptools_scm[toml]>=6.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
@@ -22,7 +22,9 @@ classifiers = [
 ]
 requires-python = ">=3.9"
 dependencies = [
-    "z3-solver==4.12.2.0",
+    "sortedcontainers>=2.4.0",
+    "toml>=0.10.2",
+    "z3-solver==4.12.6.0",
 ]
 dynamic = ["version"]
 
@@ -33,8 +35,9 @@ halmos = "halmos.__main__:main"
 "Homepage" = "https://github.com/a16z/halmos"
 
 [tool.black]
-target-versions = ["py39", "py310", "py311"]
+target-version = ["py39", "py310", "py311", "py312"]
 
 [tool.pytest.ini_options]
 # TODO: re-add test_traces.py when we have a better way to support it in CI
 addopts = "--ignore=tests/lib --ignore=tests/test_traces.py"
+# addopts = "--ignore=tests/lib"

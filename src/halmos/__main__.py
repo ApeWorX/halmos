@@ -1,49 +1,48 @@
 # SPDX-License-Identifier: AGPL-3.0
 
-import os
-import sys
-import subprocess
-import uuid
 import json
+import os
 import re
 import signal
-import traceback
+import subprocess
+import sys
 import time
+import traceback
+import uuid
 
-from argparse import Namespace
-from dataclasses import dataclass, asdict
-from importlib import metadata
-from enum import Enum
 from collections import Counter
-
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import asdict, dataclass
+from enum import Enum
+from importlib import metadata
 
+from .bytevec import ByteVec
+from .calldata import Calldata
+from .config import (
+    arg_parser,
+    default_config,
+    resolve_config_files,
+    toml_parser,
+    Config as HalmosConfig,
+)
 from .sevm import *
 from .utils import (
-    create_solver,
-    hexify,
-    stringify,
-    indent_text,
     NamedTimer,
-    yellow,
+    create_solver,
     cyan,
-    green,
-    red,
     error,
+    green,
+    hexify,
+    indent_text,
     info,
-    color_good,
-    color_warn,
-    color_info,
-    color_error,
+    red,
+    stringify,
+    yellow,
 )
 from .warnings import *
-from .parser import mk_arg_parser
-from .calldata import Calldata
 
 StrModel = Dict[str, str]
 AnyModel = UnionType[Model, StrModel]
-
-arg_parser = mk_arg_parser()
 
 # Python version >=3.8.14, >=3.9.14, >=3.10.7, or >=3.11
 if hasattr(sys, "set_int_max_str_digits"):
@@ -64,6 +63,52 @@ VERBOSITY_TRACE_COUNTEREXAMPLE = 2
 VERBOSITY_TRACE_SETUP = 3
 VERBOSITY_TRACE_PATHS = 4
 VERBOSITY_TRACE_CONSTRUCTOR = 5
+
+
+def with_devdoc(args: HalmosConfig, fn_sig: str, contract_json: Dict) -> HalmosConfig:
+    devdoc = parse_devdoc(fn_sig, contract_json)
+    if not devdoc:
+        return args
+
+    overrides = arg_parser().parse_args(devdoc.split())
+    return args.with_overrides(source=fn_sig, **vars(overrides))
+
+
+def with_natspec(
+    args: HalmosConfig, contract_name: str, contract_natspec: str
+) -> HalmosConfig:
+    if not contract_natspec:
+        return args
+
+    parsed = parse_natspec(contract_natspec)
+    if not parsed:
+        return args
+
+    overrides = arg_parser().parse_args(parsed.split())
+    return args.with_overrides(source=contract_name, **vars(overrides))
+
+
+def load_config(_args) -> HalmosConfig:
+    config = default_config()
+
+    # parse CLI args first, so that can get `--help` out of the way and resolve `--debug`
+    # but don't apply the CLI overrides yet
+    cli_overrides = arg_parser().parse_args(_args)
+
+    # then for each config file, parse it and override the args
+    config_files = resolve_config_files(_args)
+    for config_file in config_files:
+        if not os.path.exists(config_file):
+            error(f"Config file not found: {config_file}")
+            sys.exit(2)
+
+        overrides = toml_parser().parse_file(config_file)
+        config = config.with_overrides(source=config_file, **overrides)
+
+    # finally apply the CLI overrides
+    config = config.with_overrides(source="command line args", **vars(cli_overrides))
+
+    return config
 
 
 @dataclass(frozen=True)
@@ -105,9 +150,9 @@ def find_abi(abi: List, fun_info: FunctionInfo) -> Dict:
 def mk_calldata(
     abi: List,
     fun_info: FunctionInfo,
-    cd: List,
+    cd: ByteVec,
     dyn_param_size: List[str],
-    args: Namespace,
+    args: HalmosConfig,
 ) -> None:
     # find function abi
     fun_abi = find_abi(abi, fun_info)
@@ -118,10 +163,7 @@ def mk_calldata(
 
     # generate symbolic ABI calldata
     calldata = Calldata(args, mk_arrlen(args), dyn_param_size)
-    result = calldata.create(fun_abi)
-
-    # TODO: use Contract abstraction for calldata
-    wstore(cd, 4, result.size() // 8, result)
+    calldata.create(fun_abi, cd)
 
 
 def mk_callvalue() -> Word:
@@ -150,18 +192,18 @@ def mk_addr(name: str) -> Address:
     return BitVec(name, 160)
 
 
-def mk_caller(args: Namespace) -> Address:
+def mk_caller(args: HalmosConfig) -> Address:
     if args.symbolic_msg_sender:
         return mk_addr("msg_sender")
     else:
-        return con_addr(magic_address)
+        return magic_address
 
 
 def mk_this() -> Address:
-    return con_addr(magic_address + 1)
+    return magic_address + 1
 
 
-def mk_solver(args: Namespace, logic="QF_AUFBV", ctx=None, assertion=False):
+def mk_solver(args: HalmosConfig, logic="QF_AUFBV", ctx=None, assertion=False):
     timeout = (
         args.solver_timeout_assertion if assertion else args.solver_timeout_branching
     )
@@ -187,7 +229,7 @@ def rendered_initcode(context: CallContext) -> str:
     else:
         initcode_str = hexify(data)
 
-    return f"{initcode_str}({color_info(args_str)})"
+    return f"{initcode_str}({cyan(args_str)})"
 
 
 def render_output(context: CallContext, file=sys.stdout) -> None:
@@ -198,13 +240,16 @@ def render_output(context: CallContext, file=sys.stdout) -> None:
     if not failed and context.is_stuck():
         return
 
-    if output.data is not None:
+    data = output.data
+    if data is not None:
         is_create = context.message.is_create()
+        if hasattr(data, "unwrap"):
+            data = data.unwrap()
 
         returndata_str = (
-            f"<{byte_length(output.data)} bytes of code>"
+            f"<{byte_length(data)} bytes of code>"
             if (is_create and not failed)
-            else hexify(output.data)
+            else hexify(data)
         )
 
     ret_scheme = context.output.return_scheme
@@ -222,10 +267,9 @@ def render_output(context: CallContext, file=sys.stdout) -> None:
 def rendered_log(log: EventLog) -> str:
     opcode_str = f"LOG{len(log.topics)}"
     topics = [
-        f"{color_info(f'topic{i}')}={hexify(topic)}"
-        for i, topic in enumerate(log.topics)
+        f"{cyan(f'topic{i}')}={hexify(topic)}" for i, topic in enumerate(log.topics)
     ]
-    data_str = f"{color_info('data')}={hexify(log.data)}"
+    data_str = f"{cyan('data')}={hexify(log.data)}"
     args_str = ", ".join(topics + [data_str])
 
     return f"{opcode_str}({args_str})"
@@ -237,13 +281,8 @@ def rendered_trace(context: CallContext) -> str:
         return output.getvalue()
 
 
-def rendered_calldata(calldata: List[Byte]) -> str:
-    if any(is_bv(x) for x in calldata):
-        # make sure every byte is wrapped
-        calldata_bv = [x if is_bv(x) else con(x, 8) for x in calldata]
-        return hexify(simplify(concat(calldata_bv)))
-
-    return "0x" + bytes(calldata).hex() if calldata else "0x"
+def rendered_calldata(calldata: ByteVec) -> str:
+    return hexify(calldata.unwrap()) if calldata else "0x"
 
 
 def render_trace(context: CallContext, file=sys.stdout) -> None:
@@ -290,22 +329,22 @@ def render_trace(context: CallContext, file=sys.stdout) -> None:
         print(file=file)
 
 
-def run_bytecode(hexcode: str, args: Namespace) -> List[Exec]:
+def run_bytecode(hexcode: str, args: HalmosConfig) -> List[Exec]:
     solver = mk_solver(args)
     contract = Contract.from_hexcode(hexcode)
     balance = mk_balance()
     block = mk_block()
-    options = mk_options(args)
     this = mk_this()
 
     message = Message(
         target=this,
         caller=mk_caller(args),
         value=mk_callvalue(),
-        data=[],
+        data=ByteVec(),
+        call_scheme=EVM.CALL,
     )
 
-    sevm = SEVM(options)
+    sevm = SEVM(args)
     ex = sevm.mk_exec(
         code={this: contract},
         storage={this: {}},
@@ -328,7 +367,7 @@ def run_bytecode(hexcode: str, args: Namespace) -> List[Exec]:
         returndata = ex.context.output.data
 
         if error:
-            warn(
+            warn_code(
                 INTERNAL_ERROR,
                 f"{mnemonic(opcode)} failed, error={error}, returndata={returndata}",
             )
@@ -337,7 +376,7 @@ def run_bytecode(hexcode: str, args: Namespace) -> List[Exec]:
             print(f"Return data: {returndata}")
             dump_dirname = f"/tmp/halmos-{uuid.uuid4().hex}"
             model_with_context = gen_model_from_sexpr(
-                GenModelArgs(args, idx, ex.path.solver.to_smt2(), dump_dirname)
+                GenModelArgs(args, idx, ex.path.to_smt2(args), {}, dump_dirname)
             )
             print(f"Input example: {model_with_context.model}")
 
@@ -352,15 +391,16 @@ def deploy_test(
     creation_hexcode: str,
     deployed_hexcode: str,
     sevm: SEVM,
-    args: Namespace,
+    args: HalmosConfig,
     libs: Dict,
 ) -> Exec:
     this = mk_this()
     message = Message(
         target=this,
         caller=mk_caller(args),
-        value=con(0),
-        data=[],
+        value=0,
+        data=ByteVec(),
+        call_scheme=EVM.CREATE,
     )
 
     ex = sevm.mk_exec(
@@ -409,7 +449,6 @@ def deploy_test(
     if error:
         raise ValueError(f"constructor failed, error={error} returndata={returndata}")
 
-    # deployed bytecode
     deployed_bytecode = Contract(returndata)
     ex.code[this] = deployed_bytecode
     ex.pgm = deployed_bytecode
@@ -429,21 +468,22 @@ def setup(
     deployed_hexcode: str,
     abi: List,
     setup_info: FunctionInfo,
-    args: Namespace,
+    args: HalmosConfig,
     libs: Dict,
 ) -> Exec:
     setup_timer = NamedTimer("setup")
     setup_timer.create_subtimer("decode")
 
-    sevm = SEVM(mk_options(args))
+    sevm = SEVM(args)
     setup_ex = deploy_test(creation_hexcode, deployed_hexcode, sevm, args, libs)
 
     setup_timer.create_subtimer("run")
 
     setup_sig, setup_selector = (setup_info.sig, setup_info.selector)
     if setup_sig:
-        calldata = []
-        wstore(calldata, 0, 4, BitVecVal(int(setup_selector, 16), 32))
+        calldata = ByteVec()
+        calldata.append(int(setup_selector, 16).to_bytes(4, "big"))
+
         dyn_param_size = []  # TODO: propagate to run
         mk_calldata(abi, setup_info, calldata, dyn_param_size, args)
 
@@ -451,8 +491,9 @@ def setup(
             message=Message(
                 target=setup_ex.message().target,
                 caller=setup_ex.message().caller,
-                value=con(0),
+                value=0,
                 data=calldata,
+                call_scheme=EVM.CALL,
             ),
         )
 
@@ -469,11 +510,11 @@ def setup(
             error = setup_ex.context.output.error
 
             if error is None:
-                setup_exs_no_error.append((setup_ex, setup_ex.path.solver.to_smt2()))
+                setup_exs_no_error.append((setup_ex, setup_ex.path.to_smt2(args)))
 
             else:
                 if opcode not in [EVM.REVERT, EVM.INVALID]:
-                    warn(
+                    warn_code(
                         INTERNAL_ERROR,
                         f"Warning: {setup_sig} execution encountered an issue at {mnemonic(opcode)}: {error}",
                     )
@@ -490,7 +531,7 @@ def setup(
 
         if len(setup_exs_no_error) > 1:
             for setup_ex, query in setup_exs_no_error:
-                res, _ = solve(query, args)
+                res, _, _ = solve(query, args)
                 if res != unsat:
                     setup_exs.append(setup_ex)
                     if len(setup_exs) > 1:
@@ -517,7 +558,7 @@ def setup(
             print(setup_ex)
 
         if sevm.logs.bounded_loops:
-            warn(
+            warn_code(
                 LOOP_BOUND,
                 f"{setup_sig}: paths have not been fully explored due to the loop unrolling bound: {args.loop}",
             )
@@ -543,6 +584,7 @@ class ModelWithContext:
     is_valid: Optional[bool]
     index: int
     result: CheckSatResult
+    unsat_core: Optional[List]
 
 
 @dataclass(frozen=True)
@@ -574,7 +616,7 @@ def run(
     setup_ex: Exec,
     abi: List,
     fun_info: FunctionInfo,
-    args: Namespace,
+    args: HalmosConfig,
 ) -> TestResult:
     funname, funsig, funselector = fun_info.name, fun_info.sig, fun_info.selector
     if args.verbose >= 1:
@@ -586,8 +628,8 @@ def run(
     # calldata
     #
 
-    cd = []
-    wstore(cd, 0, 4, BitVecVal(int(funselector, 16), 32))
+    cd = ByteVec()
+    cd.append(int(funselector, 16).to_bytes(4, "big"))
 
     dyn_param_size = []
     mk_calldata(abi, fun_info, cd, dyn_param_size, args)
@@ -595,8 +637,9 @@ def run(
     message = Message(
         target=setup_ex.this,
         caller=setup_ex.caller(),
-        value=con(0),
+        value=0,
         data=cd,
+        call_scheme=EVM.CALL,
     )
 
     #
@@ -606,9 +649,7 @@ def run(
     timer = NamedTimer("time")
     timer.create_subtimer("paths")
 
-    options = mk_options(args)
-    sevm = SEVM(options)
-
+    sevm = SEVM(args)
     solver = mk_solver(args)
     path = Path(solver)
     path.extend_path(setup_ex.path)
@@ -655,6 +696,7 @@ def run(
     result_exs = []
     future_models = []
     counterexamples = []
+    unsat_cores = []
     traces = {}
 
     def future_callback(future_model):
@@ -663,6 +705,8 @@ def run(
 
         model, is_valid, index, result = m.model, m.is_valid, m.index, m.result
         if result == unsat:
+            if m.unsat_core:
+                unsat_cores.append(m.unsat_core)
             return
 
         # model could be an empty dict here
@@ -671,13 +715,13 @@ def run(
                 print(red(f"Counterexample: {render_model(model)}"))
                 counterexamples.append(model)
             else:
-                warn(
+                warn_code(
                     COUNTEREXAMPLE_INVALID,
                     f"Counterexample (potentially invalid): {render_model(model)}",
                 )
                 counterexamples.append(model)
         else:
-            warn(COUNTEREXAMPLE_UNKNOWN, f"Counterexample: {result}")
+            warn_code(COUNTEREXAMPLE_UNKNOWN, f"Counterexample: {result}")
 
         if args.print_failed_states:
             print(f"# {idx+1}")
@@ -696,7 +740,7 @@ def run(
 
         if args.verbose >= VERBOSITY_TRACE_PATHS:
             print(f"Path #{idx+1}:")
-            print(indent_text(str(ex.path)))
+            print(indent_text(hexify(ex.path)))
 
             print("\nTrace:")
             render_trace(ex.context)
@@ -713,10 +757,11 @@ def run(
             if args.verbose >= VERBOSITY_TRACE_COUNTEREXAMPLE:
                 traces[idx] = rendered_trace(ex.context)
 
-            query = ex.path.solver.to_smt2()
+            query = ex.path.to_smt2(args)
 
             future_model = thread_pool.submit(
-                gen_model_from_sexpr, GenModelArgs(args, idx, query, dump_dirname)
+                gen_model_from_sexpr,
+                GenModelArgs(args, idx, query, unsat_cores, dump_dirname),
             )
             future_model.add_done_callback(future_callback)
             future_models.append(future_model)
@@ -724,12 +769,13 @@ def run(
         elif ex.context.is_stuck():
             stuck.append((idx, ex, ex.context.get_stuck_reason()))
             if args.print_blocked_states:
-                traces[idx] = rendered_trace(ex.context)
+                traces[idx] = f"{hexify(ex.path)}\n{rendered_trace(ex.context)}"
 
         elif not error:
             normal += 1
 
-        if len(result_exs) >= args.width:
+        # 0 width is unlimited
+        if args.width and len(result_exs) >= args.width:
             break
 
     timer.create_subtimer("models")
@@ -752,23 +798,23 @@ def run(
 
     counter = Counter(str(m.result) for m in models)
     if counter["sat"] > 0:
-        passfail = color_warn("[FAIL]")
+        passfail = red("[FAIL]")
         exitcode = Exitcode.COUNTEREXAMPLE.value
     elif counter["unknown"] > 0:
-        passfail = color_warn("[TIMEOUT]")
+        passfail = yellow("[TIMEOUT]")
         exitcode = Exitcode.TIMEOUT.value
     elif len(stuck) > 0:
-        passfail = color_warn("[ERROR]")
+        passfail = red("[ERROR]")
         exitcode = Exitcode.STUCK.value
     elif normal == 0:
-        passfail = color_warn("[ERROR]")
+        passfail = red("[ERROR]")
         exitcode = Exitcode.REVERT_ALL.value
-        warn(
+        warn_code(
             REVERT_ALL,
             f"{funsig}: all paths have been reverted; the setup state or inputs may have been too restrictive.",
         )
     else:
-        passfail = color_good("[PASS]")
+        passfail = green("[PASS]")
         exitcode = Exitcode.PASS.value
 
     timer.stop()
@@ -780,13 +826,13 @@ def run(
     )
 
     for idx, ex, err in stuck:
-        warn(INTERNAL_ERROR, f"Encountered {err}")
+        warn_code(INTERNAL_ERROR, f"Encountered {err}")
         if args.print_blocked_states:
             print(f"\nPath #{idx+1}")
             print(traces[idx], end="")
 
     if logs.bounded_loops:
-        warn(
+        warn_code(
             LOOP_BOUND,
             f"{funsig}: paths have not been fully explored due to the loop unrolling bound: {args.loop}",
         )
@@ -794,7 +840,7 @@ def run(
             print("\n".join(logs.bounded_loops))
 
     if logs.unknown_calls:
-        warn(
+        warn_code(
             UNINTERPRETED_UNKNOWN_CALLS,
             f"{funsig}: unknown calls have been assumed to be static: {', '.join(logs.unknown_calls)}",
         )
@@ -834,8 +880,8 @@ class SetupAndRunSingleArgs:
     abi: List
     setup_info: FunctionInfo
     fun_info: FunctionInfo
-    setup_args: Namespace
-    args: Namespace
+    setup_args: HalmosConfig
+    args: HalmosConfig
     libs: Dict
 
 
@@ -865,7 +911,7 @@ def setup_and_run_single(fn_args: SetupAndRunSingleArgs) -> List[TestResult]:
             fn_args.args,
         )
     except Exception as err:
-        print(f"{color_warn('[ERROR]')} {fn_args.fun_info.sig}")
+        print(f"{color_error('[ERROR]')} {fn_args.fun_info.sig}")
         error(f"{type(err).__name__}: {err}")
         if args.debug:
             traceback.print_exc()
@@ -903,7 +949,7 @@ class RunArgs:
     abi: List
     methodIdentifiers: Dict[str, str]
 
-    args: Namespace
+    args: HalmosConfig
     contract_json: Dict
     libs: Dict
 
@@ -919,11 +965,12 @@ def run_parallel(run_args: RunArgs) -> List[TestResult]:
     )
 
     setup_info = extract_setup(methodIdentifiers)
-
+    setup_config = with_devdoc(args, setup_info.sig, run_args.contract_json)
     fun_infos = [
         FunctionInfo(funsig.split("(")[0], funsig, methodIdentifiers[funsig])
         for funsig in run_args.funsigs
     ]
+
     single_run_args = [
         SetupAndRunSingleArgs(
             creation_hexcode,
@@ -931,8 +978,8 @@ def run_parallel(run_args: RunArgs) -> List[TestResult]:
             abi,
             setup_info,
             fun_info,
-            extend_args(args, parse_devdoc(setup_info.sig, run_args.contract_json)),
-            extend_args(args, parse_devdoc(fun_info.sig, run_args.contract_json)),
+            setup_config,
+            with_devdoc(args, fun_info.sig, run_args.contract_json),
             libs,
         )
         for fun_info in fun_infos
@@ -951,21 +998,17 @@ def run_sequential(run_args: RunArgs) -> List[TestResult]:
     setup_info = extract_setup(run_args.methodIdentifiers)
 
     try:
-        setup_args = extend_args(
-            args, parse_devdoc(setup_info.sig, run_args.contract_json)
-        )
+        setup_config = with_devdoc(args, setup_info.sig, run_args.contract_json)
         setup_ex = setup(
             run_args.creation_hexcode,
             run_args.deployed_hexcode,
             run_args.abi,
             setup_info,
-            setup_args,
+            setup_config,
             run_args.libs,
         )
     except Exception as err:
-        print(
-            color_warn(f"Error: {setup_info.sig} failed: {type(err).__name__}: {err}")
-        )
+        error(f"Error: {setup_info.sig} failed: {type(err).__name__}: {err}")
         if args.debug:
             traceback.print_exc()
         return []
@@ -976,13 +1019,13 @@ def run_sequential(run_args: RunArgs) -> List[TestResult]:
             funsig.split("(")[0], funsig, run_args.methodIdentifiers[funsig]
         )
         try:
-            extended_args = extend_args(
-                args, parse_devdoc(funsig, run_args.contract_json)
-            )
-            test_result = run(setup_ex, run_args.abi, fun_info, extended_args)
+            test_config = with_devdoc(args, funsig, run_args.contract_json)
+            if test_config.debug:
+                debug(f"{test_config.formatted_layers()}")
+            test_result = run(setup_ex, run_args.abi, fun_info, test_config)
         except Exception as err:
-            print(f"{color_warn('[ERROR]')} {funsig}")
-            print(color_warn(f"{type(err).__name__}: {err}"))
+            print(f"{color_error('[ERROR]')} {funsig}")
+            error(f"{type(err).__name__}: {err}")
             if args.debug:
                 traceback.print_exc()
             test_results.append(TestResult(funsig, Exitcode.EXCEPTION.value))
@@ -993,20 +1036,12 @@ def run_sequential(run_args: RunArgs) -> List[TestResult]:
     return test_results
 
 
-def extend_args(args: Namespace, more_opts: str) -> Namespace:
-    if more_opts:
-        new_args = deepcopy(args)
-        arg_parser.parse_args(more_opts.split(), new_args)
-        return new_args
-    else:
-        return args
-
-
 @dataclass(frozen=True)
 class GenModelArgs:
-    args: Namespace
+    args: HalmosConfig
     idx: int
-    sexpr: str
+    sexpr: SMTQuery
+    known_unsat_cores: List[List]
     dump_dirname: Optional[str] = None
 
 
@@ -1014,47 +1049,113 @@ def copy_model(model: Model) -> Dict:
     return {decl: model[decl] for decl in model}
 
 
+def parse_unsat_core(output) -> Optional[List]:
+    # parsing example:
+    #   unsat
+    #   (error "the context is unsatisfiable")
+    #   (<41702> <37030> <36248> <47880>)
+    # result:
+    #   [41702, 37030, 36248, 47880]
+    match = re.search(r"unsat\s*\(\s*error\s+[^)]*\)\s*\(\s*((<[0-9]+>\s*)*)\)", output)
+    if match:
+        result = [re.sub(r"<([0-9]+)>", r"\1", name) for name in match.group(1).split()]
+        return result
+    else:
+        warn(f"error in parsing unsat core: {output}")
+        return None
+
+
 def solve(
-    query: str, args: Namespace, dump_filename: Optional[str] = None
-) -> Tuple[CheckSatResult, Model]:
+    query: SMTQuery, args: HalmosConfig, dump_filename: Optional[str] = None
+) -> Tuple[CheckSatResult, Model, Optional[List]]:
     if args.dump_smt_queries or args.solver_command:
         if not dump_filename:
             dump_filename = f"/tmp/{uuid.uuid4().hex}.smt2"
 
+        # for each implication assertion, `(assert (=> |id| c))`, in query.smtlib,
+        # generate a corresponding named assertion, `(assert (! |id| :named <id>))`.
+        # see `svem.Path.to_smt2()` for more details.
+        if args.cache_solver:
+            named_assertions = "".join(
+                [
+                    f"(assert (! |{assert_id}| :named <{assert_id}>))\n"
+                    for assert_id in query.assertions
+                ]
+            )
+
         with open(dump_filename, "w") as f:
-            print(f"Writing SMT query to {dump_filename}")
+            if args.verbose >= 1:
+                print(f"Writing SMT query to {dump_filename}")
+            if args.cache_solver:
+                f.write("(set-option :produce-unsat-cores true)\n")
             f.write("(set-logic QF_AUFBV)\n")
-            f.write(query)
+            f.write(query.smtlib)
+            if args.cache_solver:
+                f.write(named_assertions)
+            f.write("(check-sat)\n")
             f.write("(get-model)\n")
+            if args.cache_solver:
+                f.write("(get-unsat-core)\n")
 
     if args.solver_command:
         if args.verbose >= 1:
             print(f"  Checking with external solver process")
             print(f"    {args.solver_command} {dump_filename} >{dump_filename}.out")
 
+        # solver_timeout_assertion == 0 means no timeout,
+        # which translates to timeout_seconds=None for subprocess.run
+        timeout_seconds = None
+        if timeout_millis := args.solver_timeout_assertion:
+            timeout_seconds = timeout_millis / 1000
+
         cmd = args.solver_command.split() + [dump_filename]
-        res_str = subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
-        res_str_head = res_str.split("\n", 1)[0]
+        try:
+            res_str = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout_seconds
+            ).stdout.strip()
+            res_str_head = res_str.split("\n", 1)[0]
 
-        with open(f"{dump_filename}.out", "w") as f:
-            f.write(res_str)
+            with open(f"{dump_filename}.out", "w") as f:
+                f.write(res_str)
 
-        if args.verbose >= 1:
-            print(f"    {res_str_head}")
+            if args.verbose >= 1:
+                print(f"    {res_str_head}")
 
-        if res_str_head == "unsat":
-            return unsat, None
-        elif res_str_head == "sat":
-            return sat, f"{dump_filename}.out"
-        else:
-            return unknown, None
+            if res_str_head == "unsat":
+                unsat_core = parse_unsat_core(res_str) if args.cache_solver else None
+                return unsat, None, unsat_core
+            elif res_str_head == "sat":
+                return sat, f"{dump_filename}.out", None
+            else:
+                return unknown, None, None
+        except subprocess.TimeoutExpired:
+            return unknown, None, None
 
     else:
-        solver = mk_solver(args, ctx=Context(), assertion=True)
-        solver.from_string(query)
-        result = solver.check()
+        ctx = Context()
+        solver = mk_solver(args, ctx=ctx, assertion=True)
+        solver.from_string(query.smtlib)
+        if args.cache_solver:
+            solver.set(unsat_core=True)
+            ids = [Bool(f"{x}", ctx) for x in query.assertions]
+            result = solver.check(*ids)
+        else:
+            result = solver.check()
         model = copy_model(solver.model()) if result == sat else None
-        return result, model
+        unsat_core = (
+            [str(core) for core in solver.unsat_core()]
+            if args.cache_solver and result == unsat
+            else None
+        )
+        return result, model, unsat_core
+
+
+def check_unsat_cores(query, unsat_cores) -> bool:
+    # return true if the given query contains any given unsat core
+    for unsat_core in unsat_cores:
+        if all(core in query.assertions for core in unsat_core):
+            return True
+    return False
 
 
 def gen_model_from_sexpr(fn_args: GenModelArgs) -> ModelWithContext:
@@ -1070,46 +1171,55 @@ def gen_model_from_sexpr(fn_args: GenModelArgs) -> ModelWithContext:
     if args.verbose >= 1:
         print(f"Checking path condition (path id: {idx+1})")
 
-    res, model = solve(sexpr, args, dump_filename)
+    if check_unsat_cores(sexpr, fn_args.known_unsat_cores):
+        # if the given query contains an unsat-core, it is unsat; no need to run the solver.
+        if args.verbose >= 1:
+            print("  Already proven unsat")
+        return package_result(None, idx, unsat, None, args)
+
+    res, model, unsat_core = solve(sexpr, args, dump_filename)
 
     if res == sat and not is_model_valid(model):
         if args.verbose >= 1:
             print(f"  Checking again with refinement")
 
         refined_filename = dump_filename.replace(".smt2", ".refined.smt2")
-        res, model = solve(refine(sexpr), args, refined_filename)
+        res, model, unsat_core = solve(refine(sexpr), args, refined_filename)
 
-    return package_result(model, idx, res, args)
+    return package_result(model, idx, res, unsat_core, args)
 
 
 def is_unknown(result: CheckSatResult, model: Model) -> bool:
     return result == unknown or (result == sat and not is_model_valid(model))
 
 
-def refine(query: str) -> str:
+def refine(query: SMTQuery) -> SMTQuery:
+    smtlib = query.smtlib
     # replace uninterpreted abstraction with actual symbols for assertion solving
-    # TODO: replace `(evm_bvudiv x y)` with `(ite (= y (_ bv0 256)) (_ bv0 256) (bvudiv x y))`
-    #       as bvudiv is undefined when y = 0; also similarly for evm_bvurem
-    query = re.sub(r"(\(\s*)evm_(bv[a-z]+)(_[0-9]+)?\b", r"\1\2", query)
+    # TODO: replace `(f_evm_bvudiv x y)` with `(ite (= y (_ bv0 256)) (_ bv0 256) (bvudiv x y))`
+    #       as bvudiv is undefined when y = 0; also similarly for f_evm_bvurem
+    smtlib = re.sub(r"(\(\s*)f_evm_(bv[a-z]+)(_[0-9]+)?\b", r"\1\2", smtlib)
     # remove the uninterpreted function symbols
     # TODO: this will be no longer needed once is_model_valid is properly implemented
-    return re.sub(
-        r"\(\s*declare-fun\s+evm_(bv[a-z]+)(_[0-9]+)?\b",
+    smtlib = re.sub(
+        r"\(\s*declare-fun\s+f_evm_(bv[a-z]+)(_[0-9]+)?\b",
         r"(declare-fun dummy_\1\2",
-        query,
+        smtlib,
     )
+    return SMTQuery(smtlib, query.assertions)
 
 
 def package_result(
     model: Optional[UnionType[Model, str]],
     idx: int,
     result: CheckSatResult,
-    args: Namespace,
+    unsat_core: Optional[List],
+    args: HalmosConfig,
 ) -> ModelWithContext:
     if result == unsat:
         if args.verbose >= 1:
             print(f"  Invalid path; ignored (path id: {idx+1})")
-        return ModelWithContext(None, None, idx, result)
+        return ModelWithContext(None, None, idx, result, unsat_core)
 
     if result == sat:
         if args.verbose >= 1:
@@ -1125,30 +1235,30 @@ def package_result(
                 is_valid = is_model_valid(model)
                 model = to_str_model(model, args.print_full_model)
 
-        return ModelWithContext(model, is_valid, idx, result)
+        return ModelWithContext(model, is_valid, idx, result, None)
 
     else:
         if args.verbose >= 1:
             print(f"  Timeout (path id: {idx+1})")
-        return ModelWithContext(None, None, idx, result)
+        return ModelWithContext(None, None, idx, result, None)
 
 
 def is_model_valid(model: AnyModel) -> bool:
-    # TODO: evaluate the path condition against the given model after excluding evm_* symbols,
-    #       since the evm_* symbols may still appear in valid models.
+    # TODO: evaluate the path condition against the given model after excluding f_evm_* symbols,
+    #       since the f_evm_* symbols may still appear in valid models.
 
     # model is a filename, containing solver output
     if isinstance(model, str):
         with open(model, "r") as f:
             for line in f:
-                if "evm_" in line:
+                if "f_evm_" in line:
                     return False
         return True
 
     # z3 model object
     else:
         for decl in model:
-            if str(decl).startswith("evm_"):
+            if str(decl).startswith("f_evm_"):
                 return False
         return True
 
@@ -1170,40 +1280,7 @@ def render_model(model: UnionType[str, StrModel]) -> str:
     return "".join(sorted(formatted)) if formatted else "∅"
 
 
-def mk_options(args: Namespace) -> Dict:
-    options = {
-        "target": args.root,
-        "verbose": args.verbose,
-        "debug": args.debug,
-        "log": args.log,
-        "expByConst": args.smt_exp_by_const,
-        "timeout": args.solver_timeout_branching,
-        "max_memory": args.solver_max_memory,
-        "sym_jump": args.symbolic_jump,
-        "print_steps": args.print_steps,
-        "unknown_calls_return_size": args.return_size_of_unknown_calls,
-        "ffi": args.ffi,
-        "storage_layout": args.storage_layout,
-    }
-
-    if args.width is not None:
-        options["max_width"] = args.width
-
-    if args.depth is not None:
-        options["max_depth"] = args.depth
-
-    if args.loop is not None:
-        options["max_loop"] = args.loop
-
-    options["unknown_calls"] = []
-    if args.uninterpreted_unknown_calls.strip():
-        for x in args.uninterpreted_unknown_calls.split(","):
-            options["unknown_calls"].append(int(x, 0))
-
-    return options
-
-
-def mk_arrlen(args: Namespace) -> Dict[str, int]:
+def mk_arrlen(args: HalmosConfig) -> Dict[str, int]:
     arrlen = {}
     if args.array_lengths:
         for assign in [x.split("=") for x in args.array_lengths.split(",")]:
@@ -1213,7 +1290,7 @@ def mk_arrlen(args: Namespace) -> Dict[str, int]:
     return arrlen
 
 
-def parse_build_out(args: Namespace) -> Dict:
+def parse_build_out(args: HalmosConfig) -> Dict:
     result = {}  # compiler version -> source filename -> contract name -> (json, type)
 
     out_path = os.path.join(args.root, args.forge_build_out)
@@ -1272,10 +1349,9 @@ def parse_build_out(args: Namespace) -> Dict:
                     )
                 contract_map[contract_name] = (json_out, contract_type, natspec)
             except Exception as err:
-                print(
-                    color_warn(
-                        f"Skipped {json_filename} due to parsing failure: {type(err).__name__}: {err}"
-                    )
+                warn_code(
+                    PARSING_ERROR,
+                    f"Skipped {json_filename} due to parsing failure: {type(err).__name__}: {err}",
                 )
                 if args.debug:
                     traceback.print_exc()
@@ -1388,10 +1464,10 @@ def _main(_args=None) -> MainResult:
     # command line arguments
     #
 
-    args = arg_parser.parse_args(_args)
+    args = load_config(_args)
 
     if args.version:
-        print(f"Halmos {metadata.version('halmos')}")
+        print(f"halmos {metadata.version('halmos')}")
         return MainResult(0)
 
     # quick bytecode execution mode
@@ -1406,7 +1482,7 @@ def _main(_args=None) -> MainResult:
     build_cmd = [
         "forge",  # shutil.which('forge')
         "build",
-        "--build-info",
+        "--ast",
         "--root",
         args.root,
         "--extra-output",
@@ -1415,17 +1491,20 @@ def _main(_args=None) -> MainResult:
     ]
 
     # run forge without capturing stdout/stderr
+    if args.debug:
+        debug(f"Running {' '.join(build_cmd)}")
+
     build_exitcode = subprocess.run(build_cmd).returncode
 
     if build_exitcode:
-        print(color_warn(f"Build failed: {build_cmd}"))
+        error(f"Build failed: {build_cmd}")
         return MainResult(1)
 
     timer.create_subtimer("load")
     try:
         build_out = parse_build_out(args)
     except Exception as err:
-        print(color_warn(f"Build output parsing failed: {type(err).__name__}: {err}"))
+        error(f"Build output parsing failed: {type(err).__name__}: {err}")
         if args.debug:
             traceback.print_exc()
         return MainResult(1)
@@ -1491,8 +1570,9 @@ def _main(_args=None) -> MainResult:
 
         contract_path = f"{contract_json['ast']['absolutePath']}:{contract_name}"
         print(f"\nRunning {num_found} tests for {contract_path}")
-        contract_args = extend_args(args, parse_natspec(natspec)) if natspec else args
 
+        # support for `/// @custom:halmos` annotations
+        contract_args = with_natspec(args, contract_name, natspec)
         run_args = RunArgs(
             funsigs,
             creation_hexcode,
@@ -1529,12 +1609,11 @@ def _main(_args=None) -> MainResult:
         print(f"\n[time] {timer.report()}")
 
     if total_found == 0:
-        error_msg = (
+        error(
             f"Error: No tests with"
             + f" --match-contract '{contract_regex(args)}'"
             + f" --match-test '{test_regex(args)}'"
         )
-        print(color_warn(error_msg))
         return MainResult(1)
 
     exitcode = 0 if total_failed == 0 else 1
